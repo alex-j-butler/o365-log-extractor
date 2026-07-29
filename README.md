@@ -25,6 +25,44 @@ make test
 
 Or directly: `go build -o bin/o365-log-extractor ./cmd/o365-log-extractor`
 
+## Docker
+
+Images are published to GitHub Container Registry for `linux/amd64` and
+`linux/arm64`:
+
+```sh
+docker run --rm \
+  -e O365_TENANT_ID -e O365_CLIENT_ID -e O365_CLIENT_SECRET \
+  -v o365-state:/data \
+  ghcr.io/alex-j-butler/o365-log-extractor:latest \
+  -mode api -follow -vl-url http://victorialogs:9428
+```
+
+Everything after the image name is passed straight to the binary, so every
+flag in the table below works unchanged.
+
+- **Mount a volume at `/data` in `api` mode.** The working directory is
+  `/data`, so the default `-state-file` lands there. Without a volume the
+  cursor lives in the container's writable layer and is lost on recreate, and
+  every restart re-reads the whole `-lookback` window.
+- **Always override `-vl-url`.** The default `http://localhost:9428` resolves
+  to the container itself.
+- **Pass credentials as environment variables, not flags** — the same reason
+  they are kept out of the process table applies to `docker inspect`.
+- The image runs as UID `65532` and contains no shell. A named volume picks up
+  the right ownership automatically; a bind mount (`-v ./state:/data`) needs
+  `chown 65532:65532` on the host directory first.
+
+One-shot parsing of an export works the same way, mounting the file in:
+
+```sh
+docker run --rm -v "$PWD/audit-export.csv:/data/audit-export.csv:ro" \
+  ghcr.io/alex-j-butler/o365-log-extractor:latest \
+  -mode file -dry-run audit-export.csv
+```
+
+Build it locally with `make docker`.
+
 ## Quick start
 
 Parse an export and print what *would* be ingested:

@@ -1,0 +1,7 @@
+# Deny everything, then allow only what the build needs.
+*
+
+!go.mod
+!go.sum
+!cmd/
+!internal/
