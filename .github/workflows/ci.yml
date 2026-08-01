@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: "*"
   pull_request:
     branches: [main]
 
@@ -66,6 +66,7 @@ jobs:
           tags: |
             type=sha
             type=raw,value=ci-${{ github.sha }}
+            type=ref,event=branch
 
       # Build for the runner's own arch only and load it locally so the smoke
       # test below can actually run the image. Release covers multi-arch.
