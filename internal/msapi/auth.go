@@ -1,7 +1,4 @@
-// Package o365 is a minimal client for the Office 365 Management Activity
-// API: OAuth2 client-credentials auth, subscription management, content
-// listing and blob retrieval.
-package o365
+package msapi
 
 import (
 	"context"
@@ -15,32 +12,8 @@ import (
 	"time"
 )
 
-// Cloud describes the Microsoft cloud instance to talk to. The Management
-// Activity API is hosted on different endpoints per sovereign cloud.
-type Cloud struct {
-	Name     string
-	LoginURL string
-	APIURL   string
-}
-
-var clouds = map[string]Cloud{
-	"commercial": {"commercial", "https://login.microsoftonline.com", "https://manage.office.com"},
-	"gcc":        {"gcc", "https://login.microsoftonline.com", "https://manage.office.com"},
-	"gcchigh":    {"gcchigh", "https://login.microsoftonline.us", "https://manage.office365.us"},
-	"dod":        {"dod", "https://login.microsoftonline.us", "https://manage.protection.apps.mil"},
-}
-
-// LookupCloud resolves a cloud by name (commercial, gcc, gcchigh, dod).
-func LookupCloud(name string) (Cloud, error) {
-	c, ok := clouds[strings.ToLower(strings.TrimSpace(name))]
-	if !ok {
-		return Cloud{}, fmt.Errorf("unknown cloud %q (want one of: commercial, gcc, gcchigh, dod)", name)
-	}
-	return c, nil
-}
-
 // TokenSource issues and caches app-only access tokens using the OAuth2
-// client-credentials grant.
+// client-credentials grant. It is safe for concurrent use.
 type TokenSource struct {
 	tenantID     string
 	clientID     string
@@ -54,8 +27,11 @@ type TokenSource struct {
 	expiry time.Time
 }
 
-// NewTokenSource builds a token source for the given tenant and cloud.
-func NewTokenSource(cloud Cloud, tenantID, clientID, clientSecret string, hc *http.Client) *TokenSource {
+// NewTokenSource builds a token source for one tenant and one API. The
+// resource is the API's base URL (e.g. https://graph.microsoft.com); the
+// v2.0 `.default` scope is derived from it, so each API gets its own
+// independently cached token.
+func NewTokenSource(loginURL, tenantID, clientID, clientSecret, resource string, hc *http.Client) *TokenSource {
 	if hc == nil {
 		hc = http.DefaultClient
 	}
@@ -63,8 +39,8 @@ func NewTokenSource(cloud Cloud, tenantID, clientID, clientSecret string, hc *ht
 		tenantID:     tenantID,
 		clientID:     clientID,
 		clientSecret: clientSecret,
-		loginURL:     strings.TrimSuffix(cloud.LoginURL, "/"),
-		scope:        strings.TrimSuffix(cloud.APIURL, "/") + "/.default",
+		loginURL:     strings.TrimSuffix(loginURL, "/"),
+		scope:        strings.TrimSuffix(resource, "/") + "/.default",
 		httpClient:   hc,
 	}
 }
@@ -104,7 +80,7 @@ func (ts *TokenSource) Token(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("token response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("token request failed: %s: %s", resp.Status, summarise(body))
+		return "", fmt.Errorf("token request for %s failed: %s: %s", ts.scope, resp.Status, Summarise(body))
 	}
 
 	var out struct {
@@ -116,7 +92,7 @@ func (ts *TokenSource) Token(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("token response: %w", err)
 	}
 	if out.AccessToken == "" {
-		return "", fmt.Errorf("token response contained no access_token")
+		return "", fmt.Errorf("token response for %s contained no access_token", ts.scope)
 	}
 
 	ts.token = out.AccessToken
@@ -124,9 +100,9 @@ func (ts *TokenSource) Token(ctx context.Context) (string, error) {
 	return ts.token, nil
 }
 
-// summarise trims an error body so credentials-adjacent responses do not
+// Summarise trims a response body so credentials-adjacent responses do not
 // flood the logs.
-func summarise(body []byte) string {
+func Summarise(body []byte) string {
 	const limit = 512
 	s := strings.TrimSpace(string(body))
 	if len(s) > limit {
