@@ -17,6 +17,8 @@ import (
 
 	"github.com/alex-j-butler/o365-log-extractor/internal/audit"
 	"github.com/alex-j-butler/o365-log-extractor/internal/config"
+	"github.com/alex-j-butler/o365-log-extractor/internal/intune"
+	"github.com/alex-j-butler/o365-log-extractor/internal/msapi"
 	"github.com/alex-j-butler/o365-log-extractor/internal/o365"
 	"github.com/alex-j-butler/o365-log-extractor/internal/state"
 	"github.com/alex-j-butler/o365-log-extractor/internal/victorialogs"
@@ -126,36 +128,80 @@ func sourceName(path string) string {
 	return filepath.Base(path)
 }
 
-// runAPI polls the Management Activity API, ingesting every content blob it
-// has not already seen.
+// runAPI polls every configured live feed, ingesting what it has not already
+// seen.
 func runAPI(ctx context.Context, cfg *config.Config, sink *victorialogs.Client, log *slog.Logger) error {
-	client := o365.New(o365.Options{
-		Cloud:        cfg.Cloud,
-		TenantID:     cfg.TenantID,
-		ClientID:     cfg.ClientID,
-		ClientSecret: cfg.ClientSecret,
-		PublisherID:  cfg.PublisherID,
-		Logger:       log,
-		MaxRetries:   cfg.VL.MaxRetries,
-	})
-
 	st, err := state.Load(cfg.StateFile)
 	if err != nil {
 		return err
 	}
 
-	if cfg.AutoSubscribe {
-		if err := client.EnsureSubscriptions(ctx, cfg.ContentTypes); err != nil {
-			return err
+	var o365Client *o365.Client
+	if cfg.HasSource(config.SourceO365) {
+		o365Client = o365.New(o365.Options{
+			Cloud:        cfg.Cloud,
+			TenantID:     cfg.TenantID,
+			ClientID:     cfg.ClientID,
+			ClientSecret: cfg.ClientSecret,
+			PublisherID:  cfg.PublisherID,
+			Logger:       log,
+			MaxRetries:   cfg.VL.MaxRetries,
+		})
+		if cfg.AutoSubscribe {
+			if err := o365Client.EnsureSubscriptions(ctx, cfg.ContentTypes); err != nil {
+				return err
+			}
 		}
 	}
 
+	var intuneClient *intune.Client
+	if cfg.HasSource(config.SourceIntune) {
+		intuneClient = intune.New(intune.Options{
+			Cloud:        cfg.Cloud,
+			TenantID:     cfg.TenantID,
+			ClientID:     cfg.ClientID,
+			ClientSecret: cfg.ClientSecret,
+			APIVersion:   cfg.GraphAPIVersion,
+			Logger:       log,
+			MaxRetries:   cfg.VL.MaxRetries,
+		})
+	}
+
 	for {
-		if err := pollOnce(ctx, cfg, client, sink, st, log); err != nil {
-			return err
+		now := time.Now().UTC()
+
+		// Feeds are polled independently: a permission or outage problem on
+		// one must not stop the other from being collected.
+		var failures []error
+		if o365Client != nil {
+			if err := pollO365(ctx, cfg, o365Client, sink, st, log, now); err != nil {
+				if ctx.Err() != nil {
+					return err
+				}
+				log.Error("office 365 poll failed", "error", err)
+				failures = append(failures, fmt.Errorf("o365: %w", err))
+			}
 		}
+		if intuneClient != nil {
+			if err := pollIntune(ctx, cfg, intuneClient, sink, st, log, now); err != nil {
+				if ctx.Err() != nil {
+					return err
+				}
+				log.Error("intune poll failed", "error", err, "hint", intuneErrorHint(err))
+				failures = append(failures, fmt.Errorf("intune: %w", err))
+			}
+		}
+
+		// Save whatever progress was made, including a partial poll.
+		if removed := st.Prune(now); removed > 0 {
+			log.Debug("pruned expired state entries", "count", removed)
+		}
+		if err := st.Save(); err != nil {
+			return fmt.Errorf("save state: %w", err)
+		}
+
 		if !cfg.Follow {
-			return nil
+			return errors.Join(failures...)
 		}
 		log.Debug("sleeping until next poll", "interval", cfg.PollInterval)
 		select {
@@ -166,10 +212,19 @@ func runAPI(ctx context.Context, cfg *config.Config, sink *victorialogs.Client, 
 	}
 }
 
-// pollOnce reads one window of content for every configured content type.
-func pollOnce(ctx context.Context, cfg *config.Config, client *o365.Client, sink *victorialogs.Client, st *state.State, log *slog.Logger) error {
-	now := time.Now().UTC()
+// intuneErrorHint turns the most common Graph failure into an actionable
+// message, since a missing application permission looks identical to any
+// other 403.
+func intuneErrorHint(err error) string {
+	if msapi.IsForbidden(err) {
+		return "grant the DeviceManagementApps.Read.All application permission and admin consent, " +
+			"or drop 'intune' from -sources"
+	}
+	return ""
+}
 
+// pollO365 reads one window of content for every configured content type.
+func pollO365(ctx context.Context, cfg *config.Config, client *o365.Client, sink *victorialogs.Client, st *state.State, log *slog.Logger, now time.Time) error {
 	for _, contentType := range cfg.ContentTypes {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -239,12 +294,82 @@ func pollOnce(ctx context.Context, cfg *config.Config, client *o365.Client, sink
 		st.SetCursor(contentType, now)
 		log.Info("polled content type", "content_type", contentType, "records", ingested, "blobs", len(blobs), "already_seen", skipped)
 	}
+	return nil
+}
 
-	if removed := st.Prune(now); removed > 0 {
-		log.Debug("pruned expired state entries", "count", removed)
+// intuneCursorKey names the Intune cursor in the shared state file. The
+// prefix keeps it from colliding with an Office 365 content type.
+const intuneCursorKey = "Intune.AuditEvents"
+
+// pollIntune reads one window of Intune audit events from Microsoft Graph.
+//
+// Unlike the Management Activity API there are no content blobs to
+// de-duplicate against, so individual event IDs are recorded instead. They
+// only need to outlive the overlap window that re-reads them.
+func pollIntune(ctx context.Context, cfg *config.Config, client *intune.Client, sink *victorialogs.Client, st *state.State, log *slog.Logger, now time.Time) error {
+	start := now.Add(-cfg.IntuneLookback)
+	if cursor, ok := st.Cursor(intuneCursorKey); ok {
+		// Intune publishes events with a lag, so re-read behind the cursor
+		// and rely on event IDs to suppress the duplicates.
+		if resumed := cursor.Add(-cfg.Overlap); resumed.After(start) {
+			start = resumed
+		}
 	}
-	if err := st.Save(); err != nil {
-		return fmt.Errorf("save state: %w", err)
+
+	normalizer := audit.NewNormalizer()
+	normalizer.Extra = map[string]string{
+		"source":       "intune-graph-api",
+		"TenantIdHint": cfg.TenantID,
 	}
+	seenFor := 2 * cfg.Overlap
+	if seenFor < time.Hour {
+		seenFor = time.Hour
+	}
+
+	ingested, skipped := 0, 0
+	err := client.ListAuditEvents(ctx, start, now, func(raw map[string]any) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		id, _ := raw["id"].(string)
+		if id != "" {
+			if st.Seen(id) {
+				skipped++
+				return nil
+			}
+		}
+
+		record, normErr := normalizer.NormalizeIntune(raw)
+		if normErr != nil {
+			log.Debug("skipping intune event", "id", id, "error", normErr)
+			return nil
+		}
+		if err := sink.Add(ctx, record); err != nil {
+			return err
+		}
+
+		if id != "" {
+			st.MarkSeen(id, now.Add(seenFor))
+		}
+		ingested++
+		return nil
+	})
+	if err != nil {
+		// Flush what was parsed before the failure; the cursor is not
+		// advanced, so the next poll re-reads this window.
+		if flushErr := sink.Flush(ctx); flushErr != nil {
+			log.Error("flush after intune failure", "error", flushErr)
+		}
+		return err
+	}
+
+	// Flush before advancing the cursor so the cursor never claims progress
+	// for records still sitting in the buffer.
+	if err := sink.Flush(ctx); err != nil {
+		return err
+	}
+	st.SetCursor(intuneCursorKey, now)
+	log.Info("polled intune audit events", "records", ingested, "already_seen", skipped, "start", start, "end", now)
 	return nil
 }

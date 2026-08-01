@@ -4,6 +4,7 @@ package audit
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -12,6 +13,10 @@ import (
 
 // maxFlattenDepth bounds recursion when flattening nested audit payloads.
 const maxFlattenDepth = 12
+
+// errNilRecord is returned for a nil record so callers can count skips
+// without string matching.
+var errNilRecord = errors.New("nil audit record")
 
 // nameValueFields are audit properties that carry a list of {Name, Value}
 // pairs rather than a plain object. They are far more useful when expanded
@@ -45,7 +50,7 @@ func NewNormalizer() *Normalizer {
 // directly as one JSON line.
 func (n *Normalizer) Normalize(raw map[string]any) (map[string]any, error) {
 	if raw == nil {
-		return nil, fmt.Errorf("nil audit record")
+		return nil, errNilRecord
 	}
 	raw = unwrapAuditData(raw)
 
@@ -141,6 +146,11 @@ func (n *Normalizer) flatten(prefix string, v any, out map[string]any, depth int
 			return
 		}
 		for k, child := range t {
+			// Graph echoes its type annotations back on every object;
+			// they carry no audit information.
+			if strings.HasPrefix(k, "@odata.") {
+				continue
+			}
 			key := join(prefix, sanitizeKey(k))
 			if n.ExpandNameValue && nameValueFields[k] {
 				if expandNameValue(key, child, out) {
@@ -233,31 +243,46 @@ func scalarSlice(items []any) ([]string, bool) {
 	return out, true
 }
 
-// buildMessage renders a short human-readable summary used as the
-// VictoriaLogs `_msg` field, which is what free-text search matches against.
+// message renders the `_msg` summary line: an operation name followed by
+// key=value context. It is what VictoriaLogs free-text search matches
+// against, so both feeds build it the same way.
+type message struct {
+	b strings.Builder
+}
+
+func newMessage(operation string) *message {
+	m := &message{}
+	m.b.WriteString(operation)
+	return m
+}
+
+// add appends ` key=value`, skipping empty values.
+func (m *message) add(key, value string) {
+	if value == "" {
+		return
+	}
+	m.b.WriteByte(' ')
+	m.b.WriteString(key)
+	m.b.WriteByte('=')
+	m.b.WriteString(value)
+}
+
+func (m *message) String() string { return m.b.String() }
+
+// buildMessage renders the summary for an Office 365 unified audit record.
 func buildMessage(raw map[string]any) string {
-	var b strings.Builder
 	op := str(raw["Operation"])
 	if op == "" {
 		op = "AuditRecord"
 	}
-	b.WriteString(op)
 
-	add := func(key string, value string) {
-		if value == "" {
-			return
-		}
-		b.WriteByte(' ')
-		b.WriteString(key)
-		b.WriteByte('=')
-		b.WriteString(value)
-	}
-	add("user", firstNonEmpty(str(raw["UserId"]), str(raw["UserKey"])))
-	add("workload", str(raw["Workload"]))
-	add("result", str(raw["ResultStatus"]))
-	add("object", str(raw["ObjectId"]))
-	add("ip", firstNonEmpty(str(raw["ClientIP"]), str(raw["ClientIPAddress"])))
-	return b.String()
+	m := newMessage(op)
+	m.add("user", firstNonEmpty(str(raw["UserId"]), str(raw["UserKey"])))
+	m.add("workload", str(raw["Workload"]))
+	m.add("result", str(raw["ResultStatus"]))
+	m.add("object", str(raw["ObjectId"]))
+	m.add("ip", firstNonEmpty(str(raw["ClientIP"]), str(raw["ClientIPAddress"])))
+	return m.String()
 }
 
 // parseTime accepts the timestamp formats seen across the Management
